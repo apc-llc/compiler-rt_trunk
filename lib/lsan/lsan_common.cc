@@ -23,6 +23,7 @@
 #include "sanitizer_common/sanitizer_stacktrace.h"
 #include "sanitizer_common/sanitizer_suppressions.h"
 #include "sanitizer_common/sanitizer_report_decorator.h"
+#include "sanitizer_common/sanitizer_tls_get_addr.h"
 
 #if CAN_SANITIZE_LEAKS
 namespace __lsan {
@@ -33,6 +34,14 @@ BlockingMutex global_mutex(LINKER_INITIALIZED);
 
 THREADLOCAL int disable_counter;
 bool DisabledInThisThread() { return disable_counter > 0; }
+void DisableInThisThread() { disable_counter++; }
+void EnableInThisThread() {
+  if (!disable_counter && common_flags()->detect_leaks) {
+    Report("Unmatched call to __lsan_enable().\n");
+    Die();
+  }
+  disable_counter--;
+}
 
 Flags lsan_flags;
 
@@ -119,6 +128,10 @@ static inline bool CanBeAHeapPointer(uptr p) {
   return ((p >> 47) == 0);
 #elif defined(__mips64)
   return ((p >> 40) == 0);
+#elif defined(__aarch64__)
+  unsigned runtimeVMA =
+    (MostSignificantSetBitIndex(GET_CURRENT_FRAME()) + 1);
+  return ((p >> runtimeVMA) == 0);
 #else
   return true;
 #endif
@@ -181,9 +194,10 @@ static void ProcessThreads(SuspendedThreadsList const &suspended_threads,
     uptr os_id = static_cast<uptr>(suspended_threads.GetThreadID(i));
     LOG_THREADS("Processing thread %d.\n", os_id);
     uptr stack_begin, stack_end, tls_begin, tls_end, cache_begin, cache_end;
+    DTLS *dtls;
     bool thread_found = GetThreadRangesLocked(os_id, &stack_begin, &stack_end,
                                               &tls_begin, &tls_end,
-                                              &cache_begin, &cache_end);
+                                              &cache_begin, &cache_end, &dtls);
     if (!thread_found) {
       // If a thread can't be found in the thread registry, it's probably in the
       // process of destruction. Log this event and move on.
@@ -207,9 +221,18 @@ static void ProcessThreads(SuspendedThreadsList const &suspended_threads,
       LOG_THREADS("Stack at %p-%p (SP = %p).\n", stack_begin, stack_end, sp);
       if (sp < stack_begin || sp >= stack_end) {
         // SP is outside the recorded stack range (e.g. the thread is running a
-        // signal handler on alternate stack). Again, consider the entire stack
-        // range to be reachable.
+        // signal handler on alternate stack, or swapcontext was used).
+        // Again, consider the entire stack range to be reachable.
         LOG_THREADS("WARNING: stack pointer not in stack range.\n");
+        uptr page_size = GetPageSizeCached();
+        int skipped = 0;
+        while (stack_begin < stack_end &&
+               !IsAccessibleMemoryRange(stack_begin, 1)) {
+          skipped++;
+          stack_begin += page_size;
+        }
+        LOG_THREADS("Skipped %d guard page(s) to obtain stack %p-%p.\n",
+                    skipped, stack_begin, stack_end);
       } else {
         // Shrink the stack range to ignore out-of-scope values.
         stack_begin = sp;
@@ -234,6 +257,17 @@ static void ProcessThreads(SuspendedThreadsList const &suspended_threads,
         if (tls_end > cache_end)
           ScanRangeForPointers(cache_end, tls_end, frontier, "TLS", kReachable);
       }
+      if (dtls) {
+        for (uptr j = 0; j < dtls->dtv_size; ++j) {
+          uptr dtls_beg = dtls->dtv[j].beg;
+          uptr dtls_end = dtls_beg + dtls->dtv[j].size;
+          if (dtls_beg < dtls_end) {
+            LOG_THREADS("DTLS %zu at %p-%p.\n", j, dtls_beg, dtls_end);
+            ScanRangeForPointers(dtls_beg, dtls_end, frontier, "DTLS",
+                                 kReachable);
+          }
+        }
+      }
     }
   }
 }
@@ -243,8 +277,8 @@ static void ProcessRootRegion(Frontier *frontier, uptr root_begin,
   MemoryMappingLayout proc_maps(/*cache_enabled*/true);
   uptr begin, end, prot;
   while (proc_maps.Next(&begin, &end,
-                        /*offset*/ 0, /*filename*/ 0, /*filename_size*/ 0,
-                        &prot)) {
+                        /*offset*/ nullptr, /*filename*/ nullptr,
+                        /*filename_size*/ 0, &prot)) {
     uptr intersection_begin = Max(root_begin, begin);
     uptr intersection_end = Min(end, root_end);
     if (intersection_begin >= intersection_end) continue;
@@ -412,6 +446,9 @@ static bool CheckForLeaks() {
 
   if (!param.success) {
     Report("LeakSanitizer has encountered a fatal error.\n");
+    Report(
+        "HINT: For debugging, try setting environment variable "
+        "LSAN_OPTIONS=verbosity=1:log_threads=1\n");
     Die();
   }
   param.leak_report.ApplySuppressions();
@@ -484,7 +521,7 @@ static Suppression *GetSuppressionForStack(u32 stack_trace_id) {
         StackTrace::GetPreviousInstructionPc(stack.trace[i]));
     if (s) return s;
   }
-  return 0;
+  return nullptr;
 }
 
 ///// LeakReport implementation. /////
@@ -612,8 +649,8 @@ uptr LeakReport::UnsuppressedLeakCount() {
   return result;
 }
 
-}  // namespace __lsan
-#endif  // CAN_SANITIZE_LEAKS
+} // namespace __lsan
+#endif // CAN_SANITIZE_LEAKS
 
 using namespace __lsan;  // NOLINT
 
@@ -634,7 +671,7 @@ void __lsan_ignore_object(const void *p) {
            "heap object at %p is already being ignored\n", p);
   if (res == kIgnoreObjectSuccess)
     VReport(1, "__lsan_ignore_object(): ignoring heap object at %p\n", p);
-#endif  // CAN_SANITIZE_LEAKS
+#endif // CAN_SANITIZE_LEAKS
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
@@ -645,7 +682,7 @@ void __lsan_register_root_region(const void *begin, uptr size) {
   RootRegion region = {begin, size};
   root_regions->push_back(region);
   VReport(1, "Registered root region at %p of size %llu\n", begin, size);
-#endif  // CAN_SANITIZE_LEAKS
+#endif // CAN_SANITIZE_LEAKS
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
@@ -672,24 +709,20 @@ void __lsan_unregister_root_region(const void *begin, uptr size) {
         begin, size);
     Die();
   }
-#endif  // CAN_SANITIZE_LEAKS
+#endif // CAN_SANITIZE_LEAKS
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void __lsan_disable() {
 #if CAN_SANITIZE_LEAKS
-  __lsan::disable_counter++;
+  __lsan::DisableInThisThread();
 #endif
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void __lsan_enable() {
 #if CAN_SANITIZE_LEAKS
-  if (!__lsan::disable_counter && common_flags()->detect_leaks) {
-    Report("Unmatched call to __lsan_enable().\n");
-    Die();
-  }
-  __lsan::disable_counter--;
+  __lsan::EnableInThisThread();
 #endif
 }
 
@@ -698,7 +731,7 @@ void __lsan_do_leak_check() {
 #if CAN_SANITIZE_LEAKS
   if (common_flags()->detect_leaks)
     __lsan::DoLeakCheck();
-#endif  // CAN_SANITIZE_LEAKS
+#endif // CAN_SANITIZE_LEAKS
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
@@ -706,7 +739,7 @@ int __lsan_do_recoverable_leak_check() {
 #if CAN_SANITIZE_LEAKS
   if (common_flags()->detect_leaks)
     return __lsan::DoRecoverableLeakCheck();
-#endif  // CAN_SANITIZE_LEAKS
+#endif // CAN_SANITIZE_LEAKS
   return 0;
 }
 
@@ -716,4 +749,4 @@ int __lsan_is_turned_off() {
   return 0;
 }
 #endif
-}  // extern "C"
+} // extern "C"

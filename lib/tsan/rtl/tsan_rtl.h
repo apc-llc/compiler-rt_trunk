@@ -54,7 +54,7 @@ namespace __tsan {
 
 #ifndef SANITIZER_GO
 struct MapUnmapCallback;
-#if defined(__mips64) || defined(__aarch64__)
+#if defined(__mips64) || defined(__aarch64__) || defined(__powerpc__)
 static const uptr kAllocatorSpace = 0;
 static const uptr kAllocatorSize = SANITIZER_MMAP_RANGE_SIZE;
 static const uptr kAllocatorRegionSizeLog = 20;
@@ -66,7 +66,8 @@ typedef SizeClassAllocator32<kAllocatorSpace, kAllocatorSize, 0,
     CompactSizeClassMap, kAllocatorRegionSizeLog, ByteMap,
     MapUnmapCallback> PrimaryAllocator;
 #else
-typedef SizeClassAllocator64<kHeapMemBeg, kHeapMemEnd - kHeapMemBeg, 0,
+typedef SizeClassAllocator64<Mapping::kHeapMemBeg,
+    Mapping::kHeapMemEnd - Mapping::kHeapMemBeg, 0,
     DefaultSizeClassMap, MapUnmapCallback> PrimaryAllocator;
 #endif
 typedef SizeClassAllocatorLocalCache<PrimaryAllocator> AllocatorCache;
@@ -403,6 +404,8 @@ struct ThreadState {
   // If set, malloc must not be called.
   int nomalloc;
 
+  const ReportDesc *current_report;
+
   explicit ThreadState(Context *ctx, int tid, int unique_id, u64 epoch,
                        unsigned reuse_count,
                        uptr stk_addr, uptr stk_size,
@@ -410,12 +413,18 @@ struct ThreadState {
 };
 
 #ifndef SANITIZER_GO
+#if SANITIZER_MAC || SANITIZER_ANDROID
+ThreadState *cur_thread();
+void cur_thread_finalize();
+#else
 __attribute__((tls_model("initial-exec")))
 extern THREADLOCAL char cur_thread_placeholder[];
 INLINE ThreadState *cur_thread() {
   return reinterpret_cast<ThreadState *>(&cur_thread_placeholder);
 }
-#endif
+INLINE void cur_thread_finalize() { }
+#endif  // SANITIZER_MAC || SANITIZER_ANDROID
+#endif  // SANITIZER_GO
 
 class ThreadContext : public ThreadContextBase {
  public:
@@ -686,6 +695,7 @@ void MutexReadLock(ThreadState *thr, uptr pc, uptr addr, bool try_lock = false);
 void MutexReadUnlock(ThreadState *thr, uptr pc, uptr addr);
 void MutexReadOrWriteUnlock(ThreadState *thr, uptr pc, uptr addr);
 void MutexRepair(ThreadState *thr, uptr pc, uptr addr);  // call on EOWNERDEAD
+void MutexInvalidAccess(ThreadState *thr, uptr pc, uptr addr);
 
 void Acquire(ThreadState *thr, uptr pc, uptr addr);
 // AcquireGlobal synchronizes the current thread with all other threads.
@@ -709,7 +719,7 @@ void AcquireReleaseImpl(ThreadState *thr, uptr pc, SyncClock *c);
 // The trick is that the call preserves all registers and the compiler
 // does not treat it as a call.
 // If it does not work for you, use normal call.
-#if !SANITIZER_DEBUG && defined(__x86_64__)
+#if !SANITIZER_DEBUG && defined(__x86_64__) && !SANITIZER_MAC
 // The caller may not create the stack frame for itself at all,
 // so we create a reserve stack frame for it (1024b must be enough).
 #define HACKY_CALL(f) \
@@ -755,7 +765,7 @@ void ALWAYS_INLINE TraceAddEvent(ThreadState *thr, FastState fs,
 
 #ifndef SANITIZER_GO
 uptr ALWAYS_INLINE HeapEnd() {
-  return kHeapMemEnd + PrimaryAllocator::AdditionalSize();
+  return HeapMemEnd() + PrimaryAllocator::AdditionalSize();
 }
 #endif
 
